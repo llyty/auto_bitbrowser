@@ -4,9 +4,14 @@ import pyotp
 import re
 import os
 import sys
+import threading
 from playwright.async_api import async_playwright, Playwright
 from bit_api import openBrowser, closeBrowser
 from create_window import get_browser_list, get_browser_info
+from deep_translator import GoogleTranslator
+
+# Global lock for file writing safety
+file_write_lock = threading.Lock()
 
 def get_base_path():
     if getattr(sys, 'frozen', False):
@@ -14,7 +19,7 @@ def get_base_path():
     return os.path.dirname(os.path.abspath(__file__))
 
 # Helper function for automation logic
-async def _automate_login_and_extract(playwright: Playwright, browser_id: str, account_info: dict, ws_endpoint: str):
+async def _automate_login_and_extract(playwright: Playwright, browser_id: str, account_info: dict, ws_endpoint: str, log_callback=None):
     chromium = playwright.chromium
     try:
         browser = await chromium.connect_over_cdp(ws_endpoint)
@@ -22,6 +27,7 @@ async def _automate_login_and_extract(playwright: Playwright, browser_id: str, a
         page = default_context.pages[0] if default_context.pages else await default_context.new_page()
 
         print("Proxy warmup: Waiting for 2 seconds...")
+        if log_callback: log_callback("正在打开浏览器预热...")
         await asyncio.sleep(2)
 
         print('Navigating to accounts.google.com...')
@@ -43,6 +49,7 @@ async def _automate_login_and_extract(playwright: Playwright, browser_id: str, a
              email_input = await page.wait_for_selector('input[type="email"]', timeout=5000)
              if email_input:
                  print(f"Entering email: {email}")
+                 if log_callback: log_callback(f"正在输入账号: {email}")
                  await email_input.fill(email)
                  await page.click('#identifierNext >> button')
                  
@@ -107,6 +114,7 @@ async def _automate_login_and_extract(playwright: Playwright, browser_id: str, a
 
         # 5. Extract "Verify eligibility" link or check for non-eligibility
         print("Checking for eligibility...")
+        if log_callback: log_callback("正在检测学生资格...")
         
         found_link = False
         is_invalid = False
@@ -131,26 +139,172 @@ async def _automate_login_and_extract(playwright: Playwright, browser_id: str, a
             "Bu teklif kullanılamıyor" # Turkish
         ]
         
+        # Phrases indicating the account is already subscribed/verified
+        subscribed_phrases = [
+            "You're already subscribed",
+            "Bạn đã đăng ký",
+            "已订阅", 
+            "Ya estás suscrito"
+        ]
+        
+        # Phrases indicating verified but not bound ("Get student offer")
+        verified_unbound_phrases = [
+            "Get student offer",
+            "Nhận ưu đãi dành cho sinh viên",
+            "Obtener oferta para estudiantes",
+            "Obter oferta de estudante",
+            "获取学生优惠",
+            "獲取學生優惠",
+            "Dapatkan penawaran pelajar",
+        ]
+
         try:
             start_time = time.time()
             # Polling loop for 6 seconds (User requested strict 6s timeout)
             print("Checking for eligibility (max 6s)...")
             
             while time.time() - start_time < 6:
-                # Check for Verify Link First (Language Agnostic: check href)
-                # Matches any <a> tag where href contains 'sheerid.com'
-                if await page.locator('a[href*="sheerid.com"]').count() > 0:
-                    found_link = True
-                    break
+                # 1. Check for "Already Subscribed" phrases
+                is_subscribed = False
+                for phrase in subscribed_phrases:
+                    if await page.locator(f'text="{phrase}"').is_visible():
+                        print(f"Detected subscribed state with phrase: {phrase}")
+                        is_subscribed = True
+                        break
+                
+                if is_subscribed:
+                    # Save "Subscribed/Bound" accounts
+                    save_path_subscribed = os.path.join(get_base_path(), "已绑卡号.txt")
+                    
+                    # Reconstruct account line
+                    acc_line = account_info.get('email', '')
+                    if 'password' in account_info:
+                        acc_line += f"----{account_info['password']}"
+                    if 'backup' in account_info:
+                        acc_line += f"----{account_info['backup']}"
+                    if 'secret' in account_info:
+                        acc_line += f"----{account_info['secret']}"
+                        
+                    with file_write_lock:
+                        with open(save_path_subscribed, "a", encoding="utf-8") as f:
+                            f.write(f"{acc_line}\n")
+                    print(f"Saved subscribed account to {save_path_subscribed}")
+                    return True, "已绑卡 (Subscribed)"
 
-                # Check for "This offer is not available" phrases (Optional fast fail)
+                # 1.5 Check for "Verified Unbound" (Get Offer)
+                is_verified_unbound = False
+                unbound_href = ""
+                for phrase in verified_unbound_phrases:
+                    element = page.locator(f'text="{phrase}"')
+                    if await element.is_visible():
+                        print(f"Detected verified unbound state with phrase: {phrase}")
+                        is_verified_unbound = True
+                        # Try to extract href if it's a link
+                        try:
+                             if await element.evaluate("el => el.tagName === 'A'"):
+                                 unbound_href = await element.get_attribute("href")
+                             else:
+                                 parent = element.locator("xpath=..")
+                                 if await parent.count() > 0 and await parent.evaluate("el => el.tagName === 'A'"):
+                                      unbound_href = await parent.get_attribute("href")
+                        except: pass
+                        break
+                
+                if is_verified_unbound:
+                    save_path_verified = os.path.join(get_base_path(), "已验证未绑卡.txt")
+                    acc_line = account_info.get('email', '')
+                    if 'password' in account_info: acc_line += f"----{account_info['password']}"
+                    if 'backup' in account_info: acc_line += f"----{account_info['backup']}"
+                    if 'secret' in account_info: acc_line += f"----{account_info['secret']}"
+                    if unbound_href: acc_line = f"{unbound_href}----{acc_line}"
+                    
+                    with file_write_lock:
+                        with open(save_path_verified, "a", encoding="utf-8") as f:
+                            f.write(f"{acc_line}\n")
+                    print(f"Saved verified unbound account to {save_path_verified}")
+                    return True, "已过验证未绑卡 (Get Offer)"
+
+                # 2. Check for "This offer is not available" phrases
                 for phrase in not_available_phrases:
-                    # Use get_by_text for exact or partial matches
                     if await page.locator(f'text="{phrase}"').is_visible():
                         print(f"Detected invalid state with phrase: {phrase}")
                         is_invalid = True
                         break
                 
+                if is_invalid:
+                    break
+
+                # 3. Check for Verify Link (Moved here)
+                link_element = page.locator('a[href*="sheerid.com"]').first
+                if await link_element.count() > 0:
+                    found_link = True
+                    
+                    # Fallback: Translate button text to capture languages missed by verified_unbound_phrases
+                    try:
+                        text_content = await link_element.inner_text()
+                        if text_content:
+                            translated_text = GoogleTranslator(source='auto', target='en').translate(text_content).lower()
+                            print(f"Translating link text: '{text_content}' -> '{translated_text}'")
+                            
+                            if "student offer" in translated_text or "get offer" in translated_text:
+                                save_path_verified = os.path.join(get_base_path(), "已验证未绑卡.txt")
+                                acc_line = account_info.get('email', '')
+                                if 'password' in account_info: acc_line += f"----{account_info['password']}"
+                                if 'backup' in account_info: acc_line += f"----{account_info['backup']}"
+                                if 'secret' in account_info: acc_line += f"----{account_info['secret']}"
+                                
+                                href = await link_element.get_attribute("href")
+                                if href: acc_line = f"{href}----{acc_line}"
+
+                                with file_write_lock:
+                                    with open(save_path_verified, "a", encoding="utf-8") as f:
+                                        f.write(f"{acc_line}\n")
+                                print(f"Saved verified unbound account (via translation) to {save_path_verified}")
+                                return True, "已过验证未绑卡 (Get Offer Translated)"
+                    except Exception as e:
+                        print(f"Translation logic error during link check: {e}")
+                        
+                    break
+                
+                # Advanced Semantic Check (using Translation) if no direct match yet
+                if not found_link and not is_subscribed and not is_invalid:
+                    try:
+                        # Extract headings/main text (h1, h2, or role=heading)
+                        headings_loc = page.locator('h1, h2, [role="heading"]')
+                        if await headings_loc.count() > 0:
+                            headings = await headings_loc.all_inner_texts()
+                            full_text = " ".join(headings).strip()
+                            
+                            if full_text and len(full_text) < 500:
+                                # Translate to English
+                                translated = GoogleTranslator(source='auto', target='en').translate(full_text)
+                                translated_lower = translated.lower()
+                                
+                                # Semantic checks
+                                if "already subscribed" in translated_lower or "manage plan" in translated_lower:
+                                    print(f"Detected subscribed state via translation: {translated}")
+                                    is_subscribed = True
+                                elif "not available" in translated_lower or "offer is invalid" in translated_lower:
+                                    print(f"Detected invalid state via translation: {translated}")
+                                    is_invalid = True
+                    except Exception as e:
+                        pass # Ignore translation errors
+
+                # Handle Late Subscribed Detection
+                if is_subscribed:
+                    # Save "Subscribed/Bound" accounts
+                    save_path_subscribed = os.path.join(get_base_path(), "已绑卡号.txt")
+                    acc_line = account_info.get('email', '')
+                    if 'password' in account_info: acc_line += f"----{account_info['password']}"
+                    if 'backup' in account_info: acc_line += f"----{account_info['backup']}"
+                    if 'secret' in account_info: acc_line += f"----{account_info['secret']}"
+                        
+                    with file_write_lock:
+                        with open(save_path_subscribed, "a", encoding="utf-8") as f:
+                            f.write(f"{acc_line}\n")
+                    print(f"Saved subscribed account to {save_path_subscribed}")
+                    return True, "已绑卡 (Subscribed-Trans)"
+
                 if is_invalid:
                     break
                 
@@ -170,10 +324,11 @@ async def _automate_login_and_extract(playwright: Playwright, browser_id: str, a
                     
                     # Save to file
                     save_path = os.path.join(get_base_path(), "sheerIDlink.txt")
-                    with open(save_path, "a", encoding="utf-8") as f:
-                        f.write(line + "\n")
+                    with file_write_lock:
+                        with open(save_path, "a", encoding="utf-8") as f:
+                            f.write(line + "\n")
                     print(f"Saved link to {save_path}")
-                    return True
+                    return True, "提取成功 (Link Found)"
                 else:
                     print("Link element found but has no href.")
                     # fallback to invalid if link has no href? Or just return False.
@@ -185,18 +340,20 @@ async def _automate_login_and_extract(playwright: Playwright, browser_id: str, a
                 print(f"Account marked as NOT eligible: {reason}")
                 
                 save_path_invalid = os.path.join(get_base_path(), "无资格号.txt")
-                with open(save_path_invalid, "a", encoding="utf-8") as f:
-                    f.write(f"{email}\n")
+                with file_write_lock:
+                    with open(save_path_invalid, "a", encoding="utf-8") as f:
+                        f.write(f"{email}\n")
                 print(f"Saved to {save_path_invalid}")
                 
                 if not is_invalid:
                      await page.screenshot(path="debug_eligibility_timeout.png")
                 
-                return False 
+                return False, f"无资格 ({reason})" 
 
         except Exception as e:
             print(f"Failed to extract check eligibility: {e}")
             await page.screenshot(path="debug_eligibility_error.png")
+            return False, f"错误: {str(e)}"
 
         # Brief wait before closing
         await asyncio.sleep(2)
@@ -209,11 +366,11 @@ async def _automate_login_and_extract(playwright: Playwright, browser_id: str, a
     
     return False
 
-async def _async_process_wrapper(browser_id, account_info, ws_endpoint):
+async def _async_process_wrapper(browser_id, account_info, ws_endpoint, log_callback=None):
     async with async_playwright() as playwright:
-        return await _automate_login_and_extract(playwright, browser_id, account_info, ws_endpoint)
+        return await _automate_login_and_extract(playwright, browser_id, account_info, ws_endpoint, log_callback)
 
-def process_browser(browser_id):
+def process_browser(browser_id, log_callback=None):
     """
     Synchronous entry point for processing a single browser.
     Returns (success, message)
@@ -265,11 +422,17 @@ def process_browser(browser_id):
 
     try:
         # Run automation
-        success = asyncio.run(_async_process_wrapper(browser_id, account_info, ws_endpoint))
-        if success:
-            return True, "Successfully extracted and saved link."
+        result = asyncio.run(_async_process_wrapper(browser_id, account_info, ws_endpoint, log_callback))
+        
+        # Handle tuple return or boolean for backward compatibility
+        if isinstance(result, tuple):
+            success, msg = result
+            return success, msg
         else:
-            return False, "Automation finished but link not found or error occurred."
+            if result:
+                return True, "Successfully extracted and saved link."
+            else:
+                return False, "Automation finished but link not found or error occurred."
     finally:
         print(f"Closing browser {browser_id}...")
         closeBrowser(browser_id)

@@ -10,11 +10,12 @@ import os
 import threading
 import pyotp
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QPushButton, QMessageBox, QGroupBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QSplitter,
-    QAbstractItemView
+    QAbstractItemView, QSpinBox, QToolBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor, QIcon
@@ -137,34 +138,45 @@ class WorkerThread(QThread):
             self.run_sheerlink()
 
     def run_sheerlink(self):
-        """执行SheerLink提取任务"""
+        """执行SheerLink提取任务 (多线程)"""
         ids_to_process = self.kwargs.get('ids', [])
+        thread_count = self.kwargs.get('thread_count', 1)
+        
         if not ids_to_process:
              self.finished_signal.emit({'type': 'sheerlink', 'count': 0})
              return
         
-        self.log(f"\n[开始] 提取 SheerID Link 任务，共 {len(ids_to_process)} 个窗口...")
+        self.log(f"\n[开始] 提取 SheerID Link 任务，共 {len(ids_to_process)} 个窗口，并发数: {thread_count}...")
         success_count = 0
         
-        for i, browser_id in enumerate(ids_to_process, 1):
-            if not self.is_running:
-                self.log('[用户操作] 任务已停止')
-                break
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            future_to_id = {}
+            for bid in ids_to_process:
+                # Callback to log progress with ID prefix
+                # Using default arg b=bid to capture loop variable value
+                callback = lambda msg, b=bid: self.log_signal.emit(f"[{b}] {msg}")
+                future = executor.submit(process_browser, bid, log_callback=callback)
+                future_to_id[future] = bid
             
-            self.log(f"正在处理 ({i}/{len(ids_to_process)}): {browser_id}")
-            
-            # Call the processing function (BLOCKING)
-            success, msg = process_browser(browser_id)
-            
-            if success:
-                self.log(f"[成功] {msg}")
-                success_count += 1
-            else:
-                self.log(f"[失败] {msg}")
-            
-            # Delay between batches
-            self.msleep(2000)
-            
+            finished_tasks = 0
+            for future in as_completed(future_to_id):
+                if not self.is_running:
+                    self.log('[用户操作] 任务已停止 (等待当前线程完成)')
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                
+                bid = future_to_id[future]
+                finished_tasks += 1
+                try:
+                    success, msg = future.result()
+                    if success:
+                        self.log(f"[成功] ({finished_tasks}/{len(ids_to_process)}) {bid}: {msg}")
+                        success_count += 1
+                    else:
+                        self.log(f"[失败] ({finished_tasks}/{len(ids_to_process)}) {bid}: {msg}")
+                except Exception as e:
+                    self.log(f"[异常] ({finished_tasks}/{len(ids_to_process)}) {bid}: {e}")
+
         self.log(f"[完成] 提取任务结束，成功 {success_count}/{len(ids_to_process)}")
         self.finished_signal.emit({'type': 'sheerlink', 'count': success_count})
 
@@ -409,11 +421,92 @@ class BrowserWindowCreatorGUI(QMainWindow):
                 except Exception as e:
                     print(f"Failed to create {f}: {e}")
         
+    def init_function_panel(self):
+        """初始化左侧功能区"""
+        self.function_panel = QWidget()
+        self.function_panel.setFixedWidth(250)
+        self.function_panel.setVisible(False) # 默认隐藏
+        
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.function_panel.setLayout(layout)
+        
+        # 1. 标题
+        title = QLabel("🔥 功能工具箱")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px; background-color: #f0f0f0;")
+        layout.addWidget(title)
+        
+        # 2. 分区工具箱
+        self.toolbox = QToolBox()
+        self.toolbox.setStyleSheet("""
+            QToolBox::tab {
+                background: #e1e1e1;
+                border-radius: 5px;
+                color: #555;
+                font-weight: bold;
+            }
+            QToolBox::tab:selected {
+                background: #d0d0d0;
+                color: black;
+            }
+        """)
+        layout.addWidget(self.toolbox)
+        
+        # --- 谷歌分区 ---
+        google_page = QWidget()
+        google_layout = QVBoxLayout()
+        google_layout.setContentsMargins(5,10,5,10)
+        
+        # Move btn_sheerlink here
+        self.btn_sheerlink = QPushButton("一键获取 G-SheerLink")
+        self.btn_sheerlink.setFixedHeight(40)
+        self.btn_sheerlink.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sheerlink.setStyleSheet("""
+            QPushButton {
+                text-align: left; 
+                padding-left: 15px; 
+                font-weight: bold; 
+                color: white;
+                background-color: #4CAF50;
+                border-radius: 5px;
+            }
+            QPushButton:hover { background-color: #45a049; }
+        """)
+        self.btn_sheerlink.clicked.connect(self.action_get_sheerlink)
+        google_layout.addWidget(self.btn_sheerlink)
+        
+        google_layout.addStretch()
+        google_page.setLayout(google_layout)
+        self.toolbox.addItem(google_page, "Google 专区")
+        
+        # --- 微软分区 ---
+        ms_page = QWidget()
+        self.toolbox.addItem(ms_page, "Microsoft 专区")
+        
+        # --- 脸书分区 ---
+        fb_page = QWidget()
+        self.toolbox.addItem(fb_page, "Facebook 专区")
+        
+        # --- Telegram分区 ---
+        tg_page = QWidget()
+        tg_layout = QVBoxLayout()
+        tg_layout.addWidget(QLabel("功能开发中..."))
+        tg_layout.addStretch()
+        tg_page.setLayout(tg_layout)
+        self.toolbox.addItem(tg_page, "Telegram 专区")
+        
+        # 默认展开谷歌
+        self.toolbox.setCurrentIndex(0)
+
     def init_ui(self):
         """初始化UI"""
         self.setWindowTitle("比特浏览器窗口管理工具")
         self.setWindowIcon(QIcon(resource_path("beta-1.svg")))
-        self.resize(1200, 800)
+        self.resize(1300, 800)
+        
+        # Init Side Panel
+        self.init_function_panel()
         
         # 主窗口部件
         main_widget = QWidget()
@@ -421,20 +514,55 @@ class BrowserWindowCreatorGUI(QMainWindow):
         
         # 主布局 - 水平
         main_layout = QHBoxLayout()
+        main_layout.setSpacing(5)
         main_widget.setLayout(main_layout)
+        
+        # 1. Add Function Panel (Leftmost)
+        main_layout.addWidget(self.function_panel)
         
         # ================== 左侧区域 (控制 + 列表) ==================
         left_widget = QWidget()
         left_layout = QVBoxLayout()
         left_widget.setLayout(left_layout)
         
-        # 1. 标题
+        # --- Top Bar: Toggle Logic + Title + Global Settings ---
+        top_bar_layout = QHBoxLayout()
+        
+        # Toggle Button
+        self.btn_toggle_tools = QPushButton("工具箱 📂")
+        self.btn_toggle_tools.setCheckable(True)
+        self.btn_toggle_tools.setChecked(False) 
+        self.btn_toggle_tools.setFixedHeight(30)
+        self.btn_toggle_tools.setStyleSheet("""
+            QPushButton { background-color: #607D8B; color: white; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:checked { background-color: #455A64; }
+        """)
+        self.btn_toggle_tools.clicked.connect(lambda checked: self.function_panel.setVisible(checked))
+        top_bar_layout.addWidget(self.btn_toggle_tools)
+        
+        # Title
         title_label = QLabel("控制面板")
         title_font = QFont()
         title_font.setPointSize(14)
         title_font.setBold(True)
         title_label.setFont(title_font)
-        left_layout.addWidget(title_label)
+        title_label.setContentsMargins(10,0,10,0)
+        top_bar_layout.addWidget(title_label)
+        
+        top_bar_layout.addStretch()
+        
+        # Global Thread Spinbox
+        top_bar_layout.addWidget(QLabel("🔥 全局并发数:"))
+        self.thread_spinbox = QSpinBox()
+        self.thread_spinbox.setRange(1, 50)
+        self.thread_spinbox.setValue(1)
+        self.thread_spinbox.setFixedSize(70, 30)
+        self.thread_spinbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thread_spinbox.setStyleSheet("font-size: 14px; font-weight: bold; color: #E91E63;")
+        self.thread_spinbox.setToolTip("所有多线程任务的并发数量 (1-50)")
+        top_bar_layout.addWidget(self.thread_spinbox)
+        
+        left_layout.addLayout(top_bar_layout)
         
         # 2. 配置区域
         config_group = QGroupBox("创建参数配置")
@@ -519,13 +647,10 @@ class BrowserWindowCreatorGUI(QMainWindow):
         self.refresh_btn.clicked.connect(self.refresh_browser_list)
         
         self.btn_2fa = QPushButton("刷新并保存验证码")
+        self.btn_2fa = QPushButton("刷新并保存验证码")
         self.btn_2fa.setStyleSheet("color: purple; font-weight: bold;")
         self.btn_2fa.clicked.connect(self.action_refresh_2fa)
 
-        self.btn_sheerlink = QPushButton("一键获取G-sheerlink")
-        self.btn_sheerlink.setStyleSheet("color: green; font-weight: bold;")
-        self.btn_sheerlink.clicked.connect(self.action_get_sheerlink)
-        
         self.select_all_checkbox = QCheckBox("全选")
         self.select_all_checkbox.stateChanged.connect(self.toggle_select_all)
         
@@ -539,7 +664,6 @@ class BrowserWindowCreatorGUI(QMainWindow):
         
         list_action_layout.addWidget(self.refresh_btn)
         list_action_layout.addWidget(self.btn_2fa)
-        list_action_layout.addWidget(self.btn_sheerlink)
         list_action_layout.addWidget(self.select_all_checkbox)
         list_action_layout.addStretch()
         list_action_layout.addWidget(self.open_btn)
@@ -662,12 +786,17 @@ class BrowserWindowCreatorGUI(QMainWindow):
             QMessageBox.warning(self, "提示", "请先在列表中勾选要处理的窗口")
             return
         
-        reply = QMessageBox.question(self, '确认操作', 
-                                    f"确定要对选中的 {len(ids)} 个窗口执行 SheerID 提取吗？\n该操作将逐个打开窗口、自动提取并关闭。",
+        thread_count = self.thread_spinbox.value()
+        msg = f"确定要对选中的 {len(ids)} 个窗口执行 SheerID 提取吗？\n"
+        msg += f"当前并发模式: {thread_count} 线程\n"
+        if thread_count > 1:
+            msg += "⚠️ 注意: 将同时打开多个浏览器窗口，请确保电脑资源充足。"
+        
+        reply = QMessageBox.question(self, '确认操作', msg,
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
         if reply == QMessageBox.StandardButton.Yes:
-            self.start_worker_thread('sheerlink', ids=ids)
+            self.start_worker_thread('sheerlink', ids=ids, thread_count=thread_count)
         
     def open_selected_browsers(self):
         """打开选中的窗口"""

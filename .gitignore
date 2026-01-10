@@ -3,7 +3,10 @@ accounts.txt
 proxies.txt
 sheerIDlink.txt
 无资格号.txt
+已绑卡号.txt
+已验证未绑卡.txt
 2fa_codes.txt
+sheerid_tool/
 
 # Exclude all images by default
 *.jpg
